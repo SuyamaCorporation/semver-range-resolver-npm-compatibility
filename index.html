@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>セマンティックバージョン範囲解決 npm互換チェッカー</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  textarea, input[type=text] { font-family: 'Courier New', monospace; }
+</style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+
+<div class="max-w-5xl mx-auto px-4 py-6">
+  <h1 class="text-2xl font-bold text-green-400 mb-1">セマンティックバージョン範囲解決</h1>
+  <p class="text-gray-400 text-sm mb-6">npm互換チェッカー — semver.js相当のparser（外部ライブラリ不使用）</p>
+
+  <!-- 範囲式入力 -->
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
+    <div class="bg-gray-900 rounded-xl p-4 border border-gray-700">
+      <label class="text-xs text-gray-400 mb-1 block">範囲式 1（主）</label>
+      <div class="flex gap-2 mb-2">
+        <input id="range1" type="text" value="^1.2.3"
+          class="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-green-300 focus:outline-none focus:border-green-500 text-sm">
+        <button onclick="resolveAll()" class="px-4 py-2 bg-green-700 hover:bg-green-600 rounded text-sm font-semibold transition-colors">解決</button>
+      </div>
+      <div id="explain1" class="text-sm text-gray-300 bg-gray-800 rounded px-3 py-2 min-h-8"></div>
+
+      <label class="text-xs text-gray-400 mt-3 mb-1 block">範囲式 2（衝突検出用・任意）</label>
+      <input id="range2" type="text" value=">=1.3.0 <2.0.0"
+        class="w-full bg-gray-800 border border-gray-600 rounded px-3 py-2 text-yellow-300 focus:outline-none focus:border-yellow-500 text-sm mb-2">
+      <div id="explain2" class="text-sm text-gray-300 bg-gray-800 rounded px-3 py-2 min-h-8"></div>
+      <div id="intersectResult" class="mt-2 text-sm bg-gray-800 rounded px-3 py-2 min-h-8"></div>
+    </div>
+
+    <div class="bg-gray-900 rounded-xl p-4 border border-gray-700">
+      <label class="text-xs text-gray-400 mb-1 block">バージョン一覧（1行1バージョン）</label>
+      <textarea id="versionList" rows="10"
+        class="w-full bg-gray-800 border border-gray-600 rounded px-3 py-2 text-gray-200 focus:outline-none focus:border-green-500 text-sm resize-y"
+>1.0.0
+1.2.2
+1.2.3
+1.2.4
+1.3.0
+1.5.0
+1.9.9
+2.0.0
+2.1.0
+3.0.0</textarea>
+    </div>
+  </div>
+
+  <!-- プリセット -->
+  <div class="bg-gray-900 rounded-xl p-4 mb-4 border border-gray-700">
+    <p class="text-xs text-gray-400 mb-2">プリセット範囲式（クリックで挿入）:</p>
+    <div id="presets" class="flex flex-wrap gap-2"></div>
+  </div>
+
+  <!-- 判定結果 -->
+  <div class="bg-gray-900 rounded-xl p-4 mb-4 border border-gray-700">
+    <h2 class="text-sm font-semibold text-gray-300 mb-3">バージョン判定結果</h2>
+    <div id="versionResults" class="space-y-1"></div>
+  </div>
+
+  <!-- フレーバー比較表 -->
+  <div class="bg-gray-900 rounded-xl p-4 border border-gray-700">
+    <h2 class="text-base font-semibold text-gray-200 mb-3">npm / Cargo / RubyGems 範囲記法差異</h2>
+    <div class="overflow-x-auto">
+      <table class="w-full text-xs border-collapse font-mono">
+        <thead>
+          <tr class="bg-gray-800">
+            <th class="border border-gray-700 px-3 py-2 text-left text-gray-300 font-sans">意味</th>
+            <th class="border border-gray-700 px-3 py-2 text-red-400">npm (semver)</th>
+            <th class="border border-gray-700 px-3 py-2 text-orange-400">Cargo (Rust)</th>
+            <th class="border border-gray-700 px-3 py-2 text-purple-400">RubyGems</th>
+          </tr>
+        </thead>
+        <tbody id="flavorTable"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+const escHtml = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+// ---- semver parser (npm compatible, no external lib) ----
+
+function parseSemver(v) {
+  v = v.trim().replace(/^v/, '');
+  const m = v.match(/^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/);
+  if (!m) return null;
+  return [parseInt(m[1]), parseInt(m[2]), parseInt(m[3])];
+}
+
+function cmpSemver(a, b) {
+  for (let i = 0; i < 3; i++) {
+    if (a[i] !== b[i]) return a[i] - b[i];
+  }
+  return 0;
+}
+
+// Parse a single comparator like ">=1.2.3", "1.2.3", "<2.0.0"
+function parseComparator(str) {
+  str = str.trim();
+  const m = str.match(/^(>=|<=|>|<|=|~|\^|~=|~>)?\s*(.+)$/);
+  if (!m) return null;
+  const op = m[1] || '=';
+  const ver = parseSemver(m[2]);
+  if (!ver) return null;
+  return { op, ver };
+}
+
+// Expand ^ ~
+function expandCaret(ver) {
+  const [ma, mi, pa] = ver;
+  if (ma > 0) return { lo: ver, hi: [ma+1,0,0], hiInc: false };
+  if (mi > 0) return { lo: ver, hi: [0,mi+1,0], hiInc: false };
+  return { lo: ver, hi: [0,0,pa+1], hiInc: false };
+}
+
+function expandTilde(ver) {
+  const [ma, mi] = ver;
+  return { lo: ver, hi: [ma,mi+1,0], hiInc: false };
+}
+
+// returns a function: semver array -> bool
+function buildComparatorFn(str) {
+  str = str.trim();
+  if (!str || str === '*' || str === '' || str === 'x') return () => true;
+
+  // handle ^ and ~
+  if (str.startsWith('^')) {
+    const ver = parseSemver(str.slice(1));
+    if (!ver) return () => false;
+    const r = expandCaret(ver);
+    return v => cmpSemver(v, r.lo) >= 0 && cmpSemver(v, r.hi) < 0;
+  }
+  if (str.startsWith('~')) {
+    const ver = parseSemver(str.slice(1));
+    if (!ver) return () => false;
+    const r = expandTilde(ver);
+    return v => cmpSemver(v, r.lo) >= 0 && cmpSemver(v, r.hi) < 0;
+  }
+
+  const c = parseComparator(str);
+  if (!c) return () => false;
+  switch (c.op) {
+    case '>=': return v => cmpSemver(v, c.ver) >= 0;
+    case '<=': return v => cmpSemver(v, c.ver) <= 0;
+    case '>':  return v => cmpSemver(v, c.ver) > 0;
+    case '<':  return v => cmpSemver(v, c.ver) < 0;
+    default:   return v => cmpSemver(v, c.ver) === 0;
+  }
+}
+
+// A range is composed of OR-groups (||) where each group is AND of comparators
+function buildRangeFn(rangeStr) {
+  const orGroups = rangeStr.split('||').map(s => s.trim());
+  const orFns = orGroups.map(group => {
+    const parts = group.split(/\s+/).filter(Boolean);
+    const fns = parts.map(buildComparatorFn);
+    return v => fns.every(f => f(v));
+  });
+  return v => orFns.some(f => f(v));
+}
+
+function explainRange(rangeStr) {
+  if (!rangeStr.trim()) return '';
+  const str = rangeStr.trim();
+  if (str === '*' || str === '') return '任意のバージョン';
+
+  if (str.startsWith('^')) {
+    const ver = parseSemver(str.slice(1));
+    if (!ver) return '無効な範囲式';
+    const [ma, mi, pa] = ver;
+    if (ma > 0) return `^${str.slice(1)}: ${ma}.x.x で ${str.slice(1)} 以上（破壊的変更なし）`;
+    if (mi > 0) return `^${str.slice(1)}: 0.${mi}.x で ${str.slice(1)} 以上（minor固定）`;
+    return `^${str.slice(1)}: 0.0.${pa} のみ`;
+  }
+  if (str.startsWith('~')) {
+    const ver = parseSemver(str.slice(1));
+    if (!ver) return '無効な範囲式';
+    const [ma, mi] = ver;
+    return `~${str.slice(1)}: ${ma}.${mi}.x で ${str.slice(1)} 以上（patch範囲）`;
+  }
+  if (str.includes('||')) {
+    return str.split('||').map(s => explainRange(s.trim())).join(' または ');
+  }
+  if (str.includes(' ')) {
+    return str.split(/\s+/).map(s => explainSingle(s)).join(' かつ ');
+  }
+  return explainSingle(str);
+}
+
+function explainSingle(str) {
+  const c = parseComparator(str);
+  if (!c) return `無効: ${str}`;
+  const v = c.ver.join('.');
+  switch (c.op) {
+    case '>=': return `${v} 以上`;
+    case '<=': return `${v} 以下`;
+    case '>':  return `${v} より大きい`;
+    case '<':  return `${v} 未満`;
+    default:   return `${v} と完全一致`;
+  }
+}
+
+// Intersect: check if two ranges can be satisfied simultaneously
+function intersect(range1, range2) {
+  // sample versions densely
+  const candidates = [];
+  for (let ma = 0; ma <= 5; ma++)
+    for (let mi = 0; mi <= 15; mi++)
+      for (let pa = 0; pa <= 10; pa++)
+        candidates.push([ma, mi, pa]);
+  const fn1 = buildRangeFn(range1);
+  const fn2 = buildRangeFn(range2);
+  const matches = candidates.filter(v => fn1(v) && fn2(v));
+  return matches;
+}
+
+// presets
+const presets = [
+  { label: '^1.2.3', val: '^1.2.3' },
+  { label: '~2.0.0', val: '~2.0.0' },
+  { label: '>=1.0.0 <2.0.0', val: '>=1.0.0 <2.0.0' },
+  { label: '1.x', val: '>=1.0.0 <2.0.0' },
+  { label: '*', val: '*' },
+  { label: '>=1.0.0', val: '>=1.0.0' },
+  { label: '1.2.3 - 2.0.0', val: '>=1.2.3 <=2.0.0' },
+  { label: '^0.0.3', val: '^0.0.3' },
+];
+
+const presetContainer = document.getElementById('presets');
+presets.forEach(p => {
+  const btn = document.createElement('button');
+  btn.textContent = p.label;
+  btn.className = 'px-3 py-1 text-xs bg-gray-800 hover:bg-green-800 border border-gray-600 hover:border-green-500 rounded text-gray-300 font-mono transition-colors';
+  btn.onclick = () => {
+    document.getElementById('range1').value = p.val;
+    resolveAll();
+  };
+  presetContainer.appendChild(btn);
+});
+
+// flavor table
+const flavorData = [
+  ['X以上','>=X', '>=X', '>=X'],
+  ['X未満','<X','<X','<X'],
+  ['完全一致','X or =X','=X','=X'],
+  ['キャレット(破壊的変更なし)','^X.Y.Z','なし（^なし）','なし'],
+  ['チルダ（patch更新のみ）','~X.Y.Z','~X.Y.Z (Y以降固定)','~>X.Y.Z'],
+  ['範囲 AND','>=X <Y','>=X, <Y','>=X, <Y'],
+  ['範囲 OR','X || Y','複数 version = あり','なし（使わない）'],
+  ['ワイルドカード','* / X.x / X.X.*','*','なし'],
+  ['ハイフン範囲','X - Y','なし','なし'],
+  ['プレリリース','1.0.0-alpha.1','1.0.0-alpha.1','1.0.0.pre'],
+];
+
+const tbody = document.getElementById('flavorTable');
+flavorData.forEach(([feat, npm, cargo, gem]) => {
+  const tr = document.createElement('tr');
+  tr.className = 'hover:bg-gray-800/50';
+  tr.innerHTML = `
+    <td class="border border-gray-700 px-3 py-2 text-gray-300 font-sans">${feat}</td>
+    <td class="border border-gray-700 px-3 py-2 text-red-300">${npm}</td>
+    <td class="border border-gray-700 px-3 py-2 text-orange-300">${cargo}</td>
+    <td class="border border-gray-700 px-3 py-2 text-purple-300">${gem}</td>
+  `;
+  tbody.appendChild(tr);
+});
+
+function resolveAll() {
+  const r1 = document.getElementById('range1').value.trim();
+  const r2 = document.getElementById('range2').value.trim();
+  const versionsRaw = document.getElementById('versionList').value.trim().split('\n').map(s=>s.trim()).filter(Boolean);
+
+  document.getElementById('explain1').textContent = explainRange(r1);
+  document.getElementById('explain2').textContent = r2 ? explainRange(r2) : '（範囲式2は未入力）';
+
+  const fn1 = buildRangeFn(r1);
+  const resultsEl = document.getElementById('versionResults');
+  if (versionsRaw.length === 0) { resultsEl.innerHTML = '<p class="text-gray-500 text-sm">バージョンを入力してください</p>'; return; }
+
+  let html = '';
+  versionsRaw.forEach(raw => {
+    const v = parseSemver(raw);
+    if (!v) {
+      html += `<div class="flex items-center gap-3 px-3 py-1 rounded bg-gray-800">
+        <span class="font-mono text-gray-400">${escHtml(raw)}</span>
+        <span class="text-xs text-gray-500">無効なバージョン形式</span>
+      </div>`;
+      return;
+    }
+    const ok = fn1(v);
+    html += `<div class="flex items-center gap-3 px-3 py-1.5 rounded ${ok ? 'bg-green-900/30 border border-green-700/50' : 'bg-red-900/20 border border-red-800/30'}">
+      <span class="font-mono text-sm ${ok ? 'text-green-300' : 'text-red-400'}">${escHtml(raw)}</span>
+      <span class="text-xs px-2 py-0.5 rounded-full ${ok ? 'bg-green-700 text-green-100' : 'bg-red-800 text-red-200'}">${ok ? '満足' : '不満足'}</span>
+    </div>`;
+  });
+  resultsEl.innerHTML = html;
+
+  // intersect
+  const intEl = document.getElementById('intersectResult');
+  if (r2) {
+    const matches = intersect(r1, r2);
+    if (matches.length === 0) {
+      intEl.innerHTML = '<span class="text-red-400">衝突検出: 2つの範囲に共通バージョンが存在しません</span>';
+    } else {
+      const examples = matches.slice(0, 6).map(v => `<span class="font-mono text-xs text-green-300 bg-green-900/40 px-1 rounded">${v.join('.')}</span>`).join(' ');
+      intEl.innerHTML = `<span class="text-green-400">共通範囲あり</span> — 例: ${examples}${matches.length > 6 ? ` <span class="text-gray-500">他${matches.length-6}件...</span>` : ''}`;
+    }
+  } else {
+    intEl.innerHTML = '<span class="text-gray-500 text-xs">範囲式2を入力すると衝突検出を行います</span>';
+  }
+}
+
+['range1','range2','versionList'].forEach(id => {
+  document.getElementById(id).addEventListener('input', resolveAll);
+});
+resolveAll();
+</script>
+</body>
+</html>
